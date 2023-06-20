@@ -1,0 +1,584 @@
+---
+title: "term_paper_2"
+author: "Huang Po-Jui"
+date: "2023-06-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+## load game data
+```{r}
+game<- read.csv("C:/Users/user0522/Documents/GitHub/Baseball_db_HPJ/unstandardized_data.csv")
+```
+
+
+## check na
+```{r}
+colSums(is.na(game))
+```
+
+## replace na with mean value
+```{r}
+game$release_spin_rate[is.na(game$release_spin_rate)] <- mean(game$release_spin_rate, na.rm = TRUE)
+game$release_extension[is.na(game$release_extension)] <- mean(game$release_extension, na.rm = TRUE)
+game$spin_axis[is.na(game$spin_axis)] <- mean(game$spin_axis, na.rm = TRUE)
+game$BB.[is.na(game$BB.)] <- mean(game$BB., na.rm = TRUE)
+```
+
+
+## check na again
+```{r}
+colSums(is.na(game))
+```
+
+
+## check column type
+```{r}
+str(game)
+```
+
+
+## select X and Y
+```{r}
+library(dplyr)
+
+df = select(game, -c('X', 'description', 'stand', 'p_throws', 'inning_topbot', 'Name', 'Pitcher'))
+```
+
+
+## LASSO feature selection
+```{r}
+library(glmnet)
+library(caret)
+library(plotmo)
+
+library(Matrix)
+library(ggplot2)
+library(lattice)
+library(Formula)
+library(plotrix)
+library(TeachingDemos)
+
+control = trainControl(method = "cv", number = 10) 
+
+set.seed(123)
+
+LASSO_fit <- train(result ~ .-1, data = df, method = "glmnet",    
+                trControl = control,
+                tuneGrid = expand.grid(alpha = 1, lambda = 0))
+
+```
+
+
+```{r}
+coef(LASSO_fit$finalModel, LASSO_fit$bestTune$lambda)
+```
+
+
+```{r}
+X_lasso = model.matrix(result ~ .-1, data=df)
+Y_lasso = df$result
+
+df_LASSO = glmnet(X_lasso, Y_lasso, alpha = 1)
+
+print(df_LASSO)
+```
+
+```{r}
+coef(df_LASSO, s = cv.glmnet(X_lasso, Y_lasso)$lambda.1se)
+
+plot(df_LASSO, label = TRUE)
+```
+
+
+```{r}
+par(mfrow=c(1,2))
+
+plot_glmnet(df_LASSO, xvar = "lambda", 
+            label = 5,   # the "label" means the top-n variable you want the graph to show (we want it to display the top-5 variables)
+             xlab = expression(paste("log(", lambda, ")")),   # use expression() to ask R to enable Greek letters typesetting
+             ylab = expression(beta))  
+
+plot_glmnet(df_LASSO, label = 5, xlab = expression(paste("log(", lambda, ")")), ylab = expression(beta))
+```
+
+
+## using feature seleted df to fit model
+#### create feature selected df 
+```{r}
+### in this paper, I use all the non-zero coef variables except delta_run_exp
+
+lasso_selected_df = select(game, c("result", "outs_when_up", "pitch_type_CU", "zone_4.0", "zone_5.0", "zone_6.0", "zone_8.0", "zone_11.0", "zone_12.0", "zone_13.0", "zone_14.0"))
+```
+
+
+```{r}
+library(e1071)
+library(caret)
+library(gbm)
+library(pROC)
+library(plotROC)
+library(ISLR)
+```
+
+
+### train test split
+```{r}
+set.seed(123)
+
+s_train_row_number <- createDataPartition(lasso_selected_df$result, p=0.75, list=FALSE)
+
+s_train <- lasso_selected_df[s_train_row_number, ]
+s_test <- lasso_selected_df[-s_train_row_number, ]
+```
+
+
+**logit**
+```{r}
+s_logit_model <- glm(result ~ ., family = binomial, data = s_train)
+```
+
+
+**probit**
+```{r}
+s_probit_model <- glm(result ~ ., family = binomial(link = "probit"), data = s_train)
+```
+
+
+**GBM**
+```{r}
+library(rsample) 
+library(gbm)
+library(xgboost)
+library(pdp)
+library(ggplot2)
+library(purrr)
+```
+
+
+```{r}
+hyper_grid <- expand.grid(
+ shrinkage = c(.01, .1, .2),
+ interaction.depth = c(1, 3, 5),
+ n.minobsinnode = c(5, 10, 15),
+ bag.fraction = c(.5, .75, 1),
+ optimal_trees = 0, # you will fill in values from loop
+ min_RMSE = 0) 
+```
+
+
+```{r}
+for(i in 1:nrow(hyper_grid)) {
+  
+  # reproducibility
+  set.seed(123)
+  
+  # train model
+  gbm.tune <- gbm(
+    result ~ .,
+    data = s_train,
+    distribution = "bernoulli",
+    cv.folds = 10,
+    n.trees = 500,
+    interaction.depth = hyper_grid$interaction.depth[i],
+    shrinkage = hyper_grid$shrinkage[i],
+    n.minobsinnode = hyper_grid$n.minobsinnode[i],
+    bag.fraction = hyper_grid$bag.fraction[i],
+    train.fraction = .75,
+    n.cores = NULL, # will use all cores by default
+    verbose = FALSE
+  )
+  
+  # locate minimum training error from the n-th tree, add it to grid
+  hyper_grid$optimal_trees[i] <- which.min(gbm.tune$valid.error)
+  hyper_grid$min_RMSE[i] <- sqrt(min(gbm.tune$valid.error))
+}
+```
+
+
+```{r}
+optimal_para <- hyper_grid %>% dplyr::arrange(min_RMSE) %>% head(1)
+
+# define a list of optimal hyperparameters
+shrink <- optimal_para$shrinkage
+ntrees <- optimal_para$optimal_trees
+minobs <- optimal_para$n.minobsinnode
+bagfrac <- optimal_para$bag.fraction
+depth <- optimal_para$interaction.depth
+
+# train final GBM model
+s_gbm_model <- gbm(
+  result ~ .,
+  data = s_train,
+  distribution = "bernoulli",
+  cv.folds = 10,
+  n.trees = ntrees,
+  interaction.depth = depth,
+  shrinkage = shrink,
+  n.minobsinnode = minobs,
+  bag.fraction = bagfrac, 
+  n.cores = NULL, # will use all cores by default
+  verbose = FALSE
+  )  
+```
+
+
+**svm**
+```{r}
+lasso_selected_df_for_svm = lasso_selected_df
+
+svm_train <- lasso_selected_df_for_svm[s_train_row_number, ]
+svm_test <- lasso_selected_df_for_svm[-s_train_row_number, ]
+
+svm_train$result <- as.factor(svm_train$result)
+svm_test$result <- as.factor(svm_test$result)
+
+s_svm_model <- svm(result ~ ., 
+                 scale = TRUE, # the default, x and y are scaled to zero mean and unit variance
+               kernel = "radial", # other options are available
+               degree = 3, # if kernel is of type = "polynomial"
+                # gamma = if (is.vector(x)) 1 else 1 / ncol(x), # you can provide one for variable x
+               cost = 1, # the cost function (C)
+               probability = FALSE, # whether to output probability predictions
+               na.action = na.omit,
+                 data = svm_train)
+```
+
+
+**tree**
+```{r}
+library(rsample)
+library(dplyr)       # data wrangling
+library(rpart)       # performing regression trees
+library(rpart.plot)  # plotting regression trees
+library(ipred)       # bagging
+library(caret)
+```
+
+
+```{r}
+lasso_selected_df_for_tree = lasso_selected_df
+
+lasso_selected_df_for_tree$result <- as.factor(lasso_selected_df_for_tree$result)
+
+s_train_tree <- lasso_selected_df_for_tree[s_train_row_number, ]
+s_test_tree <- lasso_selected_df_for_tree[-s_train_row_number, ]
+
+
+
+hyper_grid <- expand.grid(
+  minsplit = seq(5, 20, 1),  # from 5 to 20, with an increment of 1
+  maxdepth = seq(8, 15, 1)
+)
+
+trees <- list()
+
+for (i in 1:nrow(hyper_grid)) {
+  
+  # get minsplit, maxdepth values at row i
+  minsplit <- hyper_grid$minsplit[i]
+  maxdepth <- hyper_grid$maxdepth[i]
+  # train a model and store in the list
+  # R will feed i-th minsplit and maxdepth values from hyper_grid into rpart()'s control function as hyperparameters
+  trees[[i]] <- rpart(
+    result ~ .,
+    data = s_train_tree,
+    method  = "anova",
+    control = list(minsplit = minsplit, maxdepth = maxdepth)
+    )
+}
+
+get_cp <- function(x) {
+  min <- which.min(x$cptable[, "CP"]) # to select from the column named "CP" and return a row index
+  cp <- x$cptable[min, "CP"]  # using the index to subset the desired value
+}
+
+get_min_error <- function(x) {
+  min    <- which.min(x$cptable[, "xerror"]) # to select from the column named "xerror" and return an index
+  xerror <- x$cptable[min, "xerror"]  # using the index to subset the desired value
+}
+
+hyper_grid <- hyper_grid %>%
+  mutate(
+    cp    = purrr::map_dbl(trees, get_cp),  # purrr is a useful functional programming command from the tidyverse package, map_dbl() outputs double vectors (i.e, numeric values that have decimals) from an element of an object; mutate() adds new variables while preserving existing ones (from a data.frame or data.table object)
+    error = purrr::map_dbl(trees, get_min_error)
+    ) %>%
+  arrange(error) %>%
+  top_n(-5, wt = error)
+
+min_split <- hyper_grid[1, 1]
+max_depth <- hyper_grid[1, 2]
+complexity_para <- hyper_grid[1, 3]
+
+optimal_tree <- rpart(
+    result ~ .,
+    data = s_train_tree,
+    # method  = "anova", in order to get predicted class, we need to suppress the "anove" method
+    control = list(minsplit = min_split, maxdepth = max_depth, cp = complexity_para)
+    )
+```
+
+
+```{r}
+head(trees, 1)
+```
+
+**RF**
+```{r}
+library(randomForest)
+library(rsample)     # data splitting 
+library(dplyr)       # data wrangling
+library(rpart)       # build tree models
+library(rpart.plot)  # plotting regression trees
+library(ipred)       # bagging
+library(caret)  
+library(ranger)
+library(ggplot2)
+```
+
+
+```{r}
+set.seed(123)
+
+hyper_grid_2 <- expand.grid(
+  mtry = seq(1, 4, by = 1),
+  node_size = seq(3, 9, by = 2),
+  sampe_size = c(.5, .6, .75, .80),
+  OOB_RMSE = 0
+)
+
+for(i in 1:nrow(hyper_grid_2)) {
+  
+  # train model
+  model <- ranger(
+    result ~ ., 
+    data = s_train_tree, 
+    num.trees = 100,
+    mtry = hyper_grid_2$mtry[i],
+    min.node.size = hyper_grid_2$node_size[i],
+    sample.fraction = hyper_grid_2$sampe_size[i],
+    seed = 123
+  )
+  
+  # add OOB error to grid. note how we append the list of values to the vector and index them (fill in and replace the 0 inside the OOB_RMSE column)
+  hyper_grid_2$OOB_RMSE[i] <- sqrt(model$prediction.error)
+}
+
+best_para <- hyper_grid_2 %>% 
+  dplyr::arrange(OOB_RMSE) %>%
+  head(1)
+
+m <- best_para$mtry
+node_size <- best_para$node_size
+p <- best_para$sampe_size
+
+
+optimal_ranger <- ranger(
+    result ~ ., 
+    data = s_train_tree, 
+    num.trees = 100,
+    mtry = m, # number of features
+    min.node.size = node_size, # node size
+    sample.fraction = p, # fraction of sample used in each tree
+    importance = 'impurity'
+  )
+```
+
+
+## prediction
+**logit model**
+```{r}
+pred_logit <- predict(s_logit_model, s_test, type = "response")
+
+# classify outcomes by threshold = 0.5
+convert_logit <- as.numeric(pred_logit > 0.5)
+
+# generate confusion matrix and calculate precision score
+confmat_logit <- table(Predicted = convert_logit, Actual = s_test$result)
+
+confmat_logit
+```
+
+
+**probit model**
+```{r}
+pred_probit <- predict(s_probit_model, s_test, type = "response")
+
+convert_probit <- as.numeric(pred_probit > 0.5)
+
+confmat_probit <- table(Predicted = convert_probit, Actual = s_test$result)
+
+confmat_probit
+```
+
+
+**svm**
+```{r}
+pred_svm <- predict(s_svm_model, s_test)
+
+confmat_svm <- table(Predicted = pred_svm, Actual = s_test$result)
+
+confmat_svm
+```
+
+
+**GBM**
+```{r}
+pred_gbm <- predict(s_gbm_model, s_test, type = "response")
+
+convert_gbm <- as.numeric(pred_gbm > 0.5)
+
+confmat_gbm <- table(Predicted = convert_gbm, Actual = s_test$result)
+
+confmat_gbm
+```
+
+
+**decision tree**
+```{r}
+# predict on testing data
+pred_tree <- predict(optimal_tree, newdata = s_test_tree, type = "class") # set type to "class"
+
+# create confusion matrix and generate accuracy score
+confmat_tree <- table(Predicted = pred_tree, Actual = s_test_tree$result)
+
+# view the confusion table (lots of Type II error)
+confmat_tree
+```
+
+
+**RF**
+```{r}
+# predict on testing data
+pred_rf <- predict(optimal_ranger, s_test_tree, type = "response") # set type to "class"
+
+# create confusion matrix and generate accuracy score
+confmat_rf <- table(Predicted = pred_rf$predictions, Actual = s_test$result)
+
+# view the confusion table (lots of Type II error)
+confmat_rf
+```
+
+
+```{r}
+rf_feature_importance <- data.frame(vname = names(lasso_selected_df[-1]), importance = optimal_ranger$variable.importance)  
+
+ggplot(rf_feature_importance, aes(x = reorder(vname, -importance), y = importance, fill = vname, label = round(importance, digits = 2))) +  # fill means label with variable names
+  geom_bar(stat = "Identity") +
+  ggtitle("Most important variables (in the order of 1 to 4)") +
+  xlab("Variable") + 
+  ylab("Importance") +
+  geom_text(size = 3, position = position_stack(vjust = 0.5), col = "white")
+```
+
+
+```{r}
+par(mar = c(5, 8, 1, 1)) 
+
+summary(
+  s_gbm_model, 
+  cBars = 5,  # since we have 5 variables to display
+  method = relative.influence, # you can also use permutation.test.gbm
+  las = 2
+  )
+```
+
+
+```{r}
+rpart.plot(optimal_tree)
+```
+
+
+
+## ROC & AOU
+```{r}
+ROC_logit <- roc(s_test$result, pred_logit, percent = TRUE, main = "Smoothing")
+ROC_probit <- roc(s_test$result, pred_probit, percent = TRUE, main = "Smoothing")
+
+svm.pred1 <- as.numeric(pred_svm)
+ROC_svm <- roc(s_test$result, svm.pred1, percent = TRUE, main = "Smoothing")
+ROC_gbm <- roc(s_test$result, pred_gbm, percent = TRUE, main = "Smoothing")
+
+tree.pred1 <- as.numeric(pred_tree)
+ROC_tree <- roc(s_test$result, tree.pred1, percent = TRUE, main = "Smoothing")
+
+rf.pred1 <- as.numeric(pred_rf$predictions)
+ROC_rf <- roc(s_test$result, rf.pred1, percent = TRUE, main = "Smoothing")
+```
+
+
+```{r}
+auc(ROC_logit)
+```
+
+```{r}
+auc(ROC_probit)
+```
+
+```{r}
+auc(ROC_svm)
+```
+
+```{r}
+auc(ROC_gbm)
+```
+
+```{r}
+auc(ROC_tree)
+```
+
+```{r}
+auc(ROC_rf)
+```
+
+```{r}
+par(mar=c(1,1,1,1))  # create plotting environment
+plot.roc(ROC_logit, s_test$result, percent = TRUE, main = "ROC curves", add =  FALSE, asp = NA)
+lines(ROC_probit, col = "blue")
+lines(ROC_svm, col = "red")
+lines(ROC_gbm, col = "green")
+lines(ROC_tree, col = "cyan")
+lines(ROC_rf, col = "orange")
+axis(1, at = seq(0, 1, by=0.2), labels = paste(100*seq(1,0, by=-.2)), tick = TRUE)
+legend(40, 20, 
+       legend = c("model   AUC", "logit: 82.63%", "probit: 82.63%", "SVM: 50%", "GBM: 82.59%", "Tree: 50%", "RF: 50%"),
+       col = c("white", "black", "blue", "red", "green", "cyan", "orange"),
+       lty = c(1, 1, 2, 3, 4, 5, 6),
+       pch = c(NA, NA, NA, NA, NA, NA, NA),
+       cex = 0.7)
+```
+
+
+## comparison: svm model without lasso feature selection
+```{r}
+compare_df_for_svm = df
+
+compare_svm_train <- compare_df_for_svm[s_train_row_number, ]
+compare_svm_test <- compare_df_for_svm[-s_train_row_number, ]
+
+compare_svm_train$result <- as.factor(compare_svm_train$result)
+compare_svm_test$result <- as.factor(compare_svm_test$result)
+
+compare_svm_model <- svm(result ~ ., 
+                 scale = TRUE, # the default, x and y are scaled to zero mean and unit variance
+               kernel = "radial", # other options are available
+               degree = 3, # if kernel is of type = "polynomial"
+                # gamma = if (is.vector(x)) 1 else 1 / ncol(x), # you can provide one for variable x
+               cost = 1, # the cost function (C)
+               probability = FALSE, # whether to output probability predictions
+               na.action = na.omit,
+                 data = compare_svm_train)
+
+pred_svm_compare <- predict(compare_svm_model, compare_svm_test)
+
+confmat_svm_compare <- table(Predicted = pred_svm_compare, Actual = compare_svm_test$result)
+
+confmat_svm_compare
+
+```
+
+
