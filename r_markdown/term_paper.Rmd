@@ -12,7 +12,7 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 # load game data
 ```{r}
-game<- read.csv("C:/Users/user0522/Documents/GitHub/Baseball_db_HPJ/unstandardized_data.csv")
+game<- read.csv("https://raw.githubusercontent.com/HuangPJ2022/Baseball_db_HPJ/main/unstandardized_data.csv")
 ```
 
 # data pre-process
@@ -713,4 +713,6 @@ legend(40, 20,
        pch = c(NA, NA, NA, NA, NA, NA, NA, NA),
        cex = 0.7)
 ```
+
+
 
